@@ -1,109 +1,136 @@
-require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
+const dotenv = require('dotenv');
 const cors = require('cors');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+const http = require('http'); // New Import
+const { Server } = require('socket.io'); // New Import
 
-// Models
-const Book = require('./models/Book');
-const User = require('./models/User');
+dotenv.config();
 
 const app = express();
-const PORT = 5000;
-const SECRET_KEY = "my_super_secret_key_123"; 
+const PORT = process.env.PORT || 5000;
 
-// Middleware
 app.use(cors());
 app.use(express.json());
 
-// Database Connection
-mongoose.connect('mongodb://127.0.0.1:27017/rebook')
-  .then(() => console.log('✅ MongoDB Connected Successfully'))
-  .catch(err => console.error('❌ MongoDB Connection Error:', err));
-
-// --- 🔐 AUTH ROUTES ---
-
-// 1. REGISTER
-app.post('/api/register', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    const hashedPassword = await bcrypt.hash(password, 10);
-    const newUser = new User({ username, password: hashedPassword });
-    await newUser.save();
-    res.status(201).json({ message: 'User registered successfully!' });
-  } catch (err) {
-    res.status(400).json({ error: 'Username already exists' });
+// --- SOCKET.IO SETUP ---
+const server = http.createServer(app); // Wrap Express in HTTP server
+const io = new Server(server, {
+  cors: {
+    origin: "http://localhost:5173", // Allow your React Frontend
+    methods: ["GET", "POST"]
   }
 });
 
-// 2. LOGIN
+// Listen for connection events
+io.on("connection", (socket) => {
+  console.log(`User Connected: ${socket.id}`);
+
+  // Join a specific chat room (Unique per book)
+  socket.on("join_room", (room) => {
+    socket.join(room);
+    console.log(`User joined room: ${room}`);
+  });
+
+  // Handle sending messages
+  socket.on("send_message", (data) => {
+    // Broadcast message to everyone in that room EXCEPT sender
+    socket.to(data.room).emit("receive_message", data);
+  });
+
+  socket.on("disconnect", () => {
+    console.log("User Disconnected", socket.id);
+  });
+});
+
+// --- DATABASE CONNECTION ---
+mongoose.connect(process.env.MONGO_URI)
+  .then(() => console.log("✅ MongoDB Connected Successfully"))
+  .catch(err => console.log("❌ MongoDB Connection Error:", err));
+
+// --- MODELS ---
+const bookSchema = new mongoose.Schema({
+  title: String,
+  author: String,
+  genre: String,
+  condition: String,
+  location: String,
+  imageUrl: String,
+  owner: String,
+  status: { type: String, default: 'Available' }
+});
+const Book = mongoose.model('Book', bookSchema);
+
+const userSchema = new mongoose.Schema({
+  username: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  savedBooks: [{ type: String }] 
+});
+const User = mongoose.model('User', userSchema);
+
+// --- ROUTES ---
+app.get('/api/books', async (req, res) => {
+  try { const books = await Book.find(); res.json(books); } 
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/books', async (req, res) => {
+  try { const newBook = new Book(req.body); await newBook.save(); res.status(201).json(newBook); } 
+  catch (error) { res.status(400).json({ error: error.message }); }
+});
+
+app.put('/api/books/:id', async (req, res) => {
+  try { const updatedBook = await Book.findByIdAndUpdate(req.params.id, req.body, { new: true }); res.json(updatedBook); } 
+  catch (error) { res.status(400).json({ error: error.message }); }
+});
+
+app.delete('/api/books/:id', async (req, res) => {
+  try { await Book.findByIdAndDelete(req.params.id); res.json({ message: "Book deleted" }); } 
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.post('/api/register', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    const existingUser = await User.findOne({ username });
+    if (existingUser) return res.status(400).json({ error: "Username already taken" });
+    const newUser = new User({ username, password });
+    await newUser.save();
+    res.status(201).json({ message: "User created" });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 app.post('/api/login', async (req, res) => {
   try {
     const { username, password } = req.body;
     const user = await User.findOne({ username });
-    
-    // Check if user exists
-    if (!user) return res.status(400).json({ error: 'User not found' });
-
-    // Check password
-    const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) return res.status(400).json({ error: 'Invalid credentials' });
-
-    // Generate Token (The VIP Pass)
-    const token = jwt.sign({ id: user._id, username: user.username }, SECRET_KEY);
-    res.json({ token, username: user.username });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    if (!user || user.password !== password) return res.status(400).json({ error: "Invalid credentials" });
+    res.json({ token: "dummy-token-123", username: user.username });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// --- 📚 BOOK ROUTES ---
+app.get('/api/users/:username', async (req, res) => {
+  try { const user = await User.findOne({ username: req.params.username }); res.json(user); } 
+  catch (error) { res.status(500).json({ error: error.message }); }
+});
 
-// GET All Books
-app.get('/api/books', async (req, res) => {
+app.put('/api/users/wishlist/:bookId', async (req, res) => {
   try {
-    const books = await Book.find().sort({ createdAt: -1 });
-    res.json(books);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    const { username } = req.body;
+    const bookId = req.params.bookId;
+    const user = await User.findOne({ username });
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    const index = user.savedBooks.indexOf(bookId);
+    if (index === -1) user.savedBooks.push(bookId);
+    else user.savedBooks.splice(index, 1);
+
+    await user.save();
+    res.json({ savedBooks: user.savedBooks, message: "Updated" });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// POST New Book
-app.post('/api/books', async (req, res) => {
-  try {
-    const newBook = new Book(req.body);
-    await newBook.save();
-    res.status(201).json(newBook);
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
+// IMPORTANT: Use server.listen, not app.listen
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
-
-// PUT: Update Book Status (Request or Accept)
-app.put('/api/books/:id', async (req, res) => {
-  try {
-    const book = await Book.findById(req.params.id);
-    if (!book) return res.status(404).json({ message: 'Book not found' });
-    
-    // ⚡ NEW: Use the status sent from Frontend, or default to 'Pending Exchange'
-    book.status = req.body.status || 'Pending Exchange';
-    
-    await book.save();
-    res.json(book);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-// DELETE: Remove a book
-app.delete('/api/books/:id', async (req, res) => {
-  try {
-    await Book.findByIdAndDelete(req.params.id);
-    res.json({ message: 'Book deleted successfully' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-// Start Server
-app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
