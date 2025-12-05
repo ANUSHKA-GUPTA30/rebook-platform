@@ -96,6 +96,14 @@ app.put('/api/books/:id', async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
+// DELETE: Remove a book
+app.delete('/api/books/:id', async (req, res) => {
+  try {
+    await Book.findByIdAndDelete(req.params.id);
+    res.json({ message: 'Book deleted successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 // Start Server
 app.listen(PORT, () => console.log(`🚀 Server running on http://localhost:${PORT}`));
